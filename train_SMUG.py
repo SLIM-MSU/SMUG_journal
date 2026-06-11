@@ -1,3 +1,8 @@
+"""
+Fine-tunes SMUG by adding Gaussian noise at each unrolled denoiser input, and averaging the denoiser outputs. 
+Its loss combines the unrolled stability denoising term with final reconstruction MSE, and it saves the best checkpoint as vali_best.pth.
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -13,20 +18,15 @@ from options.tune_options import TuneOptions
 opt = TuneOptions().parse()
 opt.smoothing = 'SMUG'
 
-device = torch.device("cuda:" + str(opt.gpu_ids[0]) if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:" + str(opt.gpu_ids[0]) if torch.cuda.is_available() and len(opt.gpu_ids) > 0 else "cpu")
 
-netG = DIDN(2, 2, num_chans=64, pad_data=True, global_residual=True, n_res_blocks=2)
+netG = DIDN(2, 2, num_chans=64, pad_data=True, global_residual=True, n_res_blocks=opt.n_res_blocks)
 netG.load_state_dict(torch.load(opt.netGpath, map_location=device))
 netG = netG.float()
-netG = nn.DataParallel(netG, device_ids=opt.gpu_ids)
+if len(opt.gpu_ids) > 0 and torch.cuda.is_available():
+    netG = nn.DataParallel(netG, device_ids=opt.gpu_ids)
 netG = netG.to(device)
 
-# vanilla_netG = DIDN(2, 2, num_chans=64, pad_data=True, global_residual=True, n_res_blocks=2)
-# vanilla_netG.load_state_dict(torch.load(opt.netGpath, map_location=device))
-# vanilla_netG = vanilla_netG.float()
-# vanilla_netG = nn.DataParallel(vanilla_netG, device_ids=opt.gpu_ids)
-# vanilla_netG = vanilla_netG.to(device)
-# vanilla_netG.requires_grad_(False)
 
 def lambda_rule(epoch):
     lr_l = 1.0 - max(0, epoch + 1 - 20) / float(opt.epoch + 1 - 20)
@@ -41,12 +41,10 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimG, lr_lambda=lambda_rule)
 def CG(output, tol, L, smap, mask, alised_image):
     return networks.CG.apply(output, tol, L, smap, mask, alised_image)
 
-# def Recon_Vanilla(cg_iter, smap, mask, input):
-#     output_CG = input
-#     for i in range(cg_iter):
-#         output_NN = vanilla_netG(output_CG)
-#         output_CG = CG(output_NN, tol=opt.CGtol, L=opt.Lambda, smap=smap, mask=mask, alised_image=input)
-#     return output_CG
+
+def average_repeated_batch(tensor, batch_size, num_sample):
+    return tensor.reshape(num_sample, batch_size, *tensor.shape[1:]).mean(dim=0)
+
 
 def Recon(cg_iter, smap, mask, input, label, smoothing=False, num_sample=10, epsilon=0.01, is_train=False):
     output_CG = input
@@ -56,37 +54,25 @@ def Recon(cg_iter, smap, mask, input, label, smoothing=False, num_sample=10, eps
             output_CG = CG(output_NN, tol=opt.CGtol, L=opt.Lambda, smap=smap, mask=mask, alised_image=input)
         return output_CG, None
     else:
-        loss = 0.
-        # if is_train:
-        #     label_NN = netG(label)
-        #     label_NN_i = label_NN.repeat(num_sample, 1, 1, 1)
-        #     label_NN_vanilla = vanilla_netG(label)
-        #     label_NN_vanilla_i = label_NN_vanilla.repeat(num_sample, 1, 1, 1)
-
-        # same noise used
-        noises = torch.normal(0, epsilon, output_CG.repeat(num_sample, 1, 1, 1).shape).to(device)
+        batch_size = input.shape[0]
+        loss = torch.zeros((), device=device)
+        target_denoised = netG(label) if is_train else None
 
         for _ in range(cg_iter):
             output_CG_i = output_CG.repeat(num_sample, 1, 1, 1)
-            # noises = torch.normal(0, epsilon, output_CG_i.shape).to(device)
+            noises = torch.normal(0, epsilon, output_CG_i.shape).to(device)
             noised_input = torch.clamp(noises + output_CG_i, min=-1, max=1)
             output_NN = netG(noised_input)
 
             if is_train:
-                # loss += loss_fn(output_NN, vanilla_netG(output_CG).repeat(num_sample, 1, 1, 1)) # D_theta_0(x_i)
-                # loss += loss_fn(output_NN, netG(output_CG).repeat(num_sample, 1, 1, 1)) # x_i
-                loss += loss_fn(output_NN, label.repeat(num_sample, 1, 1, 1)) # x_label
+                loss += loss_fn(output_NN, target_denoised.repeat(num_sample, 1, 1, 1))
 
-            output_NN_final = torch.zeros_like(input).to(device)
-            for j in range(opt.batchSize):
-                output_NN_final[j, :, :, :] = torch.sum(output_NN[j::opt.batchSize, :, :, :], 0)
-            output_NN_final /= num_sample
+            output_NN_final = average_repeated_batch(output_NN, batch_size, num_sample)
 
             output_CG = CG(output_NN_final, tol=opt.CGtol, L=opt.Lambda, smap=smap, mask=mask, alised_image=input)
 
         if is_train:
             loss += loss_fn(output_CG, label) * opt.LossLambda
-            # loss = loss_fn(output_CG, Recon_Vanilla(cg_iter=cg_iter, smap=smap, mask=mask, input=input))
 
         return output_CG, loss
 
@@ -189,7 +175,8 @@ for epoch in tqdm(range(opt.epoch)):
 
     if vali_rmse_min is None or vali_rmse_total < vali_rmse_min:
         vali_rmse_min = vali_rmse_total
-        torch.save(netG.module.state_dict(), os.path.join(expr_dir, 'vali_best.pth')) # .module when using DataParallel
+        state_dict = netG.module.state_dict() if isinstance(netG, nn.DataParallel) else netG.state_dict()
+        torch.save(state_dict, os.path.join(expr_dir, 'vali_best.pth'))
         print(f'saving vali best model at epoch {epoch}')
 
     train_rmse.append(train_rmse_total / train_size * opt.batchSize)
